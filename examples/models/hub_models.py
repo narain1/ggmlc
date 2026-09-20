@@ -44,11 +44,14 @@ def load_minilm_model(seq_len: int = 16) -> tuple[nn.Module, tuple[torch.Tensor,
     return MiniLMWrapper(model), example_input, input_names
 
 
-def load_gpt2_model(seq_len: int = 8) -> tuple[nn.Module, tuple[torch.Tensor, ...], list[str]]:
-    """Loads real Hugging Face GPT-2 checkpoint."""
+def load_gpt2_model(
+    variant: str = "openai-community/gpt2",
+    seq_len: int = 8,
+) -> tuple[nn.Module, tuple[torch.Tensor, ...], list[str]]:
+    """Loads real Hugging Face GPT-2 checkpoint (e.g. gpt2, gpt2-medium)."""
     from transformers import GPT2LMHeadModel
 
-    model = GPT2LMHeadModel.from_pretrained("openai-community/gpt2").eval()
+    model = GPT2LMHeadModel.from_pretrained(variant).eval()
     base_ids = [542, 67, 876, 414, 26, 335, 620, 924]
     if seq_len <= len(base_ids):
         input_ids = torch.tensor([base_ids[:seq_len]], dtype=torch.int32)
@@ -56,31 +59,122 @@ def load_gpt2_model(seq_len: int = 8) -> tuple[nn.Module, tuple[torch.Tensor, ..
         # Repeat or generate tokens
         repeated = (base_ids * ((seq_len // len(base_ids)) + 1))[:seq_len]
         input_ids = torch.tensor([repeated], dtype=torch.int32)
-    example_input = (input_ids,)
-    input_names = ["input_ids"]
+    pos_ids = torch.arange(0, input_ids.shape[-1], dtype=torch.int32).unsqueeze(0)
+    example_input = (input_ids, pos_ids)
+    input_names = ["input_ids", "position_ids"]
 
     class GPT2Wrapper(nn.Module):
         def __init__(self, base):
             super().__init__()
             self.wte = base.transformer.wte
             self.wpe = base.transformer.wpe
-            self.blocks = nn.ModuleList([base.transformer.h[i] for i in range(12)])
             self.ln_f = base.transformer.ln_f
             self.lm_head = base.lm_head
+            self.hidden_size = base.config.n_embd
+            self.num_heads = base.config.n_head
+            self.head_dim = self.hidden_size // self.num_heads
+            self.layers = nn.ModuleList()
 
-        def forward(self, input_ids):
-            pos_ids = torch.arange(0, input_ids.shape[-1], dtype=torch.int32).unsqueeze(0)
-            h = self.wte(input_ids) + self.wpe(pos_ids)
-            for blk in self.blocks:
-                if h.ndim == 2:
-                    h = h.unsqueeze(0)
-                h = blk(h)[0]
-            if h.ndim == 2:
-                h = h.unsqueeze(0)
+            hidden = self.hidden_size
+            mlp_dim = 4 * hidden
+            for h in base.transformer.h:
+                w_qkv = h.attn.c_attn.weight  # [hidden, 3 * hidden]
+                b_qkv = h.attn.c_attn.bias  # [3 * hidden]
+
+                q_proj = nn.Linear(hidden, hidden)
+                k_proj = nn.Linear(hidden, hidden)
+                v_proj = nn.Linear(hidden, hidden)
+
+                q_proj.weight.data = w_qkv[:, :hidden].t().contiguous()
+                q_proj.bias.data = b_qkv[:hidden].contiguous()
+
+                k_proj.weight.data = w_qkv[:, hidden : 2 * hidden].t().contiguous()
+                k_proj.bias.data = b_qkv[hidden : 2 * hidden].contiguous()
+
+                v_proj.weight.data = w_qkv[:, 2 * hidden :].t().contiguous()
+                v_proj.bias.data = b_qkv[2 * hidden :].contiguous()
+
+                out_proj = nn.Linear(hidden, hidden)
+                out_proj.weight.data = h.attn.c_proj.weight.t().contiguous()
+                out_proj.bias.data = h.attn.c_proj.bias.contiguous()
+
+                mlp_fc = nn.Linear(hidden, mlp_dim)
+                mlp_fc.weight.data = h.mlp.c_fc.weight.t().contiguous()
+                mlp_fc.bias.data = h.mlp.c_fc.bias.contiguous()
+
+                mlp_proj = nn.Linear(mlp_dim, hidden)
+                mlp_proj.weight.data = h.mlp.c_proj.weight.t().contiguous()
+                mlp_proj.bias.data = h.mlp.c_proj.bias.contiguous()
+
+                layer = nn.ModuleDict(
+                    {
+                        "ln_1": h.ln_1,
+                        "q_proj": q_proj,
+                        "k_proj": k_proj,
+                        "v_proj": v_proj,
+                        "out_proj": out_proj,
+                        "ln_2": h.ln_2,
+                        "mlp_fc": mlp_fc,
+                        "mlp_proj": mlp_proj,
+                    }
+                )
+                self.layers.append(layer)
+
+        def forward(self, input_ids, position_ids=None):
+            bsz, seq_len = input_ids.shape
+            if position_ids is None:
+                position_ids = torch.arange(
+                    0, seq_len, dtype=torch.int32, device=input_ids.device
+                ).unsqueeze(0)
+            h = self.wte(input_ids) + self.wpe(position_ids)
+
+            for layer in self.layers:
+                residual = h
+                h_norm = layer["ln_1"](h)
+
+                q = (
+                    layer["q_proj"](h_norm)
+                    .view(bsz, seq_len, self.num_heads, self.head_dim)
+                    .transpose(1, 2)
+                )
+                k = (
+                    layer["k_proj"](h_norm)
+                    .view(bsz, seq_len, self.num_heads, self.head_dim)
+                    .transpose(1, 2)
+                )
+                v = (
+                    layer["v_proj"](h_norm)
+                    .view(bsz, seq_len, self.num_heads, self.head_dim)
+                    .transpose(1, 2)
+                )
+
+                attn_out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+                attn_out = attn_out.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
+                attn_out = layer["out_proj"](attn_out)
+                h = residual + attn_out
+
+                residual = h
+                h_norm = layer["ln_2"](h)
+                mlp_act = torch.nn.functional.gelu(layer["mlp_fc"](h_norm), approximate="tanh")
+                mlp_out = layer["mlp_proj"](mlp_act)
+                h = residual + mlp_out
+
             h = self.ln_f(h)
             return self.lm_head(h)
 
-    return GPT2Wrapper(model), example_input, input_names
+    wrapped = GPT2Wrapper(model)
+    import gc
+
+    del model
+    gc.collect()
+    return wrapped, example_input, input_names
+
+
+def load_gpt2_medium_model(
+    seq_len: int = 8,
+) -> tuple[nn.Module, tuple[torch.Tensor, ...], list[str]]:
+    """Loads GPT-2 Medium (355M) checkpoint."""
+    return load_gpt2_model(variant="openai-community/gpt2-medium", seq_len=seq_len)
 
 
 def load_qwen_model(
@@ -371,7 +465,36 @@ def load_smollm2_model(
             h = self.norm(h)
             return self.lm_head(h)
 
-    return SmolLM2Wrapper(model), example_input, input_names
+    wrapped = SmolLM2Wrapper(model)
+    import gc
+
+    del model
+    gc.collect()
+    return wrapped, example_input, input_names
+
+
+def load_smollm2_360m_model(
+    variant: str = "HuggingFaceTB/SmolLM2-360M-Instruct",
+    seq_len: int = 8,
+) -> tuple[nn.Module, tuple[torch.Tensor, ...], list[str]]:
+    """Loads SmolLM2 360M checkpoint."""
+    return load_smollm2_model(variant=variant, seq_len=seq_len)
+
+
+def load_qwen_1_5b_model(
+    variant: str = "Qwen/Qwen2.5-1.5B",
+    seq_len: int = 8,
+) -> tuple[nn.Module, tuple[torch.Tensor, ...], list[str]]:
+    """Loads Qwen2.5 1.5B checkpoint."""
+    return load_qwen_model(variant=variant, seq_len=seq_len)
+
+
+def load_llama_model(
+    variant: str = "unsloth/Llama-3.2-1B-Instruct",
+    seq_len: int = 8,
+) -> tuple[nn.Module, tuple[torch.Tensor, ...], list[str]]:
+    """Loads LLaMA-3 / LLaMA-3.2 architecture checkpoint."""
+    return load_smollm2_model(variant=variant, seq_len=seq_len)
 
 
 def load_gemma3_model(

@@ -78,7 +78,20 @@ NB_MODULE(_runtime, m) {
         })
         .def_prop_ro("type", [](const ggmlc::SerializedTensor& t) {
             return static_cast<int32_t>(t.type);
-        });
+        })
+        .def("symbol_index", [](const ggmlc::SerializedTensor& t, int axis) -> int64_t {
+            if (axis < 0 || axis > 3 || !t.ne[axis] || t.ne[axis]->type != ggmlc::DimType::SYMBOL) {
+                return -1;
+            }
+            return t.ne[axis]->val;
+        }, "axis"_a);
+
+    nb::class_<ggmlc::SerializedOp>(m, "SerializedOp")
+        .def_ro("id", &ggmlc::SerializedOp::id)
+        .def_ro("opcode", &ggmlc::SerializedOp::opcode)
+        .def_ro("name", &ggmlc::SerializedOp::name)
+        .def_ro("inputs", &ggmlc::SerializedOp::inputs)
+        .def_ro("outputs", &ggmlc::SerializedOp::outputs);
 
     // SerializedModelGraph
     nb::class_<ggmlc::SerializedModelGraph>(m, "SerializedModelGraph")
@@ -87,7 +100,8 @@ NB_MODULE(_runtime, m) {
         .def_ro("inputs", &ggmlc::SerializedModelGraph::inputs)
         .def_ro("outputs", &ggmlc::SerializedModelGraph::outputs)
         .def_ro("parameters", &ggmlc::SerializedModelGraph::parameters)
-        .def_ro("tensors", &ggmlc::SerializedModelGraph::tensors);
+        .def_ro("tensors", &ggmlc::SerializedModelGraph::tensors)
+        .def_ro("ops", &ggmlc::SerializedModelGraph::ops);
 
     // ModelLoader
     nb::class_<ggmlc::ModelLoader>(m, "ModelLoader")
@@ -143,6 +157,10 @@ NB_MODULE(_runtime, m) {
             nb::gil_scoped_release release;
             self.run(n_threads);
         }, "n_threads"_a = 1)
+        .def("synchronize", [](ggmlc::ModelExecutor& self) {
+            nb::gil_scoped_release release;
+            self.synchronize();
+        })
         .def("get_output_bytes", [](ggmlc::ModelExecutor& self, uint32_t tensor_id) -> nb::bytes {
             const void* ptr = self.get_output_data(tensor_id);
             size_t size_bytes = self.get_tensor_size_bytes(tensor_id);
@@ -189,7 +207,14 @@ NB_MODULE(_runtime, m) {
         .def("is_cuda_graph_captured", &ggmlc::ModelExecutor::is_cuda_graph_captured)
         .def("set_enable_cuda_graph_buckets", &ggmlc::ModelExecutor::set_enable_cuda_graph_buckets, "enable"_a)
         .def("is_cuda_graph_buckets_enabled", &ggmlc::ModelExecutor::is_cuda_graph_buckets_enabled)
-        .def("is_cuda_graph_bucket_captured", &ggmlc::ModelExecutor::is_cuda_graph_bucket_captured, "batch_size"_a);
+        .def("is_cuda_graph_bucket_captured", &ggmlc::ModelExecutor::is_cuda_graph_bucket_captured, "batch_size"_a)
+        .def("set_enable_profile", &ggmlc::ModelExecutor::set_enable_profile, "enable"_a)
+        .def("reset_profile", &ggmlc::ModelExecutor::reset_profile)
+        .def("set_logits_last_only", &ggmlc::ModelExecutor::set_logits_last_only, "enable"_a)
+        .def("logits_last_only", &ggmlc::ModelExecutor::logits_last_only)
+        .def("runtime_graph_summary", &ggmlc::ModelExecutor::runtime_graph_summary)
+        .def("runtime_mul_mat_shape_summary", &ggmlc::ModelExecutor::runtime_mul_mat_shape_summary)
+        .def_static("ggml_cuda_graphs_compiled", &ggmlc::ModelExecutor::ggml_cuda_graphs_compiled);
 
     // VMMBlockManager
     nb::class_<ggmlc::VMMBlockManager>(m, "NativeVMMBlockManager")

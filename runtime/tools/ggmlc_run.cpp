@@ -9,65 +9,135 @@
 #include <algorithm>
 #include <cstdlib>
 #include <iomanip>
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 #include "ggmlc/loader.h"
 #include "ggmlc/executor.h"
 #include "ggmlc/pipeline/image.h"
 #include "ggmlc/pipeline/tokenizer.h"
 #include "ggmlc/batch_scheduler.h"
 
+static inline bool is_stdout_tty() {
+#if defined(_WIN32)
+    return _isatty(_fileno(stdout)) != 0;
+#else
+    return isatty(fileno(stdout)) != 0;
+#endif
+}
+
+static std::string prog_base(const char* argv0) {
+    std::string s = argv0 ? argv0 : "ggmlc-run";
+    const auto p = s.find_last_of("/\\");
+    if (p != std::string::npos) s = s.substr(p + 1);
+    return s;
+}
+
+static bool is_ggmlc_run_command(const std::string& s) {
+    return s == "help" || s == "info" || s == "chat" || s == "prompt" || s == "serve" || s == "run";
+}
+
 static void print_help(const char* prog_name) {
-    std::cout << "================================================================================\n"
-              << " ggmlc-run : High-Performance Standalone Neural Program Runner & Text Generator\n"
-              << "================================================================================\n"
-              << "Usage: " << prog_name << " <model.gguf> [options]\n\n"
-              << "Inspection Options:\n"
-              << "  -h, --help                  Show this comprehensive help message and exit\n"
-              << "  --info                      Inspect GGUF metadata, tensor graph, and capabilities\n\n"
-              << "Text Generation & Chat Options (SLMs):\n"
-              << "  --chat <message>            Instruction chat generation with automatic template\n"
-              << "  --prompt <string>           Autoregressive text completion from raw prompt\n"
-              << "  --system <message>          System instruction prompt for chat template\n"
-              << "  --generate                  Enable autoregressive token generation\n"
-              << "  --max-tokens <N>            Maximum new tokens to generate (default: 32)\n"
-              << "  --temperature <T>           Sampling temperature (0.0 = greedy argmax, default: 0.0)\n"
-              << "  --top-p <P>                 Nucleus sampling probability (default: 0.9)\n"
-              << "  --echo-prompt               Echo prompt before streaming response (for debugging)\n"
-              << "  --show-special              Print special control tokens (e.g. <|im_end|>)\n\n"
-              << "High-Throughput Serving & Paging Options:\n"
-              << "  --serve                     Start continuous batching server session\n"
-              << "  --paged-kv                  Enable Driver-VMM Paged KV Cache (zero-copy VRAM mapping)\n"
-              << "  --max-batch <N>             Maximum batch size for continuous batching (default: 8)\n"
-              << "  --gpu-utilization <ratio>   Pre-allocate physical blocks matching VRAM fraction (e.g. 0.9)\n"
-              << "  --warm-blocks <N>           Max warm physical 2 MB blocks to retain in free list (default: 64)\n"
-              << "  --no-prefix-cache           Disable Radix Tree prefix caching\n\n"
-              << "Preprocessing Options:\n"
-              << "  --image <name:file.jpg>     Preprocess and set image tensor (bicubic + normalize)\n"
-              << "  --text <name:string>        Tokenize and set text input tensor (BPE/WordPiece)\n\n"
-              << "Execution & Hardware Options:\n"
-              << "  --device <cpu|cuda>         Execution device (default: cpu)\n"
-              << "  --threads <N>               Number of CPU execution threads (default: 1)\n"
-              << "  --chunk-size <N>            Prompt prefill chunk/ubatch size (default: 128, 0=disable)\n"
-              << "  --ubatch <N>                Alias for --chunk-size\n"
-              << "  --cuda-graph                Enable CUDA graph capture for low-latency GPU execution\n"
-              << "  --unplanned                 Disable memory arena reuse planning (for debugging)\n"
-              << "  --symbol <key=value>        Bind dynamic symbol (e.g. s=128)\n\n"
-              << "Raw Tensor I/O Options:\n"
-              << "  --input <name:file.bin>     Load raw input tensor from binary file\n"
-              << "  --output <id:file.bin>      Save computed output tensor ID to binary file\n"
-              << "  --state-in <name:file.bin>  Load recurrent initial state from binary file\n"
-              << "  --state-out <name:file.bin> Save recurrent final state to binary file\n\n"
-              << "Examples:\n"
-              << "  1. Instruction Chat with SmolLM2 / Llama:\n"
-              << "     " << prog_name << " smollm2.gguf --chat \"What is gravity?\" --threads 4\n\n"
-              << "  2. Chat with System Prompt on NVIDIA GPU:\n"
-              << "     " << prog_name << " model.gguf --system \"You are concise.\" --chat \"Hello!\" --device cuda\n\n"
-              << "  3. Text Completion:\n"
-              << "     " << prog_name << " gpt2.gguf --prompt \"Once upon a time\" --max-tokens 24\n\n"
-              << "  4. Inspect Model Capabilities & Tasks:\n"
-              << "     " << prog_name << " model.gguf --info\n\n"
-              << "  5. Image Classification / Vision Inference:\n"
-              << "     " << prog_name << " resnet50.gguf --image x:cat.jpg --threads 4\n"
-              << "================================================================================\n";
+    const std::string p = prog_base(prog_name);
+    std::cout
+        << "ggmlc-run — execute a compiled GGUF neural program (chat, vision, raw tensors).\n\n"
+        << "Usage:\n"
+        << "  " << p << " <command> <model.gguf> [options]\n\n"
+        << "Commands:\n"
+        << "  help      Show this help\n"
+        << "  info      Inspect GGUF metadata, graph, and capabilities\n"
+        << "  chat      Instruction chat with the embedded template\n"
+        << "  prompt    Autoregressive continuation from a raw string\n"
+        << "  serve     Continuous-batching interactive session\n"
+        << "  run       One-shot graph execution (vision / raw tensors)  (default)\n\n"
+        << "HELP\n"
+        << "  " << p << " help\n\n"
+        << "  -h, --help                    Same as this command\n\n"
+        << "INFO\n"
+        << "  " << p << " info <model.gguf>\n\n"
+        << "  Print architecture, tasks, tokenizer/vision capabilities, inputs, outputs.\n\n"
+        << "  <model.gguf>                  Compiled GGUF\n\n"
+        << "CHAT\n"
+        << "  " << p << " chat <model.gguf> <message> [--system <MSG>] [--max-tokens <N>]\n"
+        << "              [--temperature <T>] [--top-p <P>] [--echo-prompt] [--show-special]\n"
+        << "              [--chunk-size <N>] [--ubatch <N>] [--device <cpu|cuda>]\n"
+        << "              [--threads <N>] [--cuda-graph] [--unplanned] [--symbol <k=v>]\n\n"
+        << "  Apply the chat template and stream only the assistant reply.\n\n"
+        << "  <model.gguf>                  Compiled GGUF with tokenizer metadata\n"
+        << "  <message>                     User turn\n"
+        << "  --system <MSG>                System instruction for the template\n"
+        << "  --max-tokens <N>              New tokens to generate  (default: 32)\n"
+        << "  --temperature <T>             Sampling temperature; 0 = greedy  (default: 0)\n"
+        << "  --top-p <P>                   Nucleus sampling cutoff  (default: 0.9)\n"
+        << "  --echo-prompt                 Print the formatted prompt before the reply\n"
+        << "  --show-special                Print special tokens instead of stopping silently\n"
+        << "  --chunk-size <N>, --ubatch <N>\n"
+        << "                                Prefill chunk size  (default: 128, 0 = one pass)\n"
+        << "  --device <cpu|cuda>           Execution device  (default: cpu)\n"
+        << "  --threads <N>                 CPU workers  (default: 1)\n"
+        << "  --cuda-graph                  Capture a CUDA graph for decode\n"
+        << "  --unplanned                   Disable arena reuse (debug)\n"
+        << "  --symbol <k=v>                Bind a dynamic dimension (e.g. s=128)\n\n"
+        << "PROMPT\n"
+        << "  " << p << " prompt <model.gguf> <string> [--max-tokens <N>] [--temperature <T>]\n"
+        << "                [--top-p <P>] [--echo-prompt] [--show-special] [--generate]\n"
+        << "                [--chunk-size <N>] [--ubatch <N>] [--device <cpu|cuda>]\n"
+        << "                [--threads <N>] [--cuda-graph] [--unplanned] [--symbol <k=v>]\n\n"
+        << "  Continue a raw prompt with no chat template.\n\n"
+        << "  <model.gguf>                  Compiled GGUF with tokenizer metadata\n"
+        << "  <string>                      Prompt text\n"
+        << "  --max-tokens <N>              New tokens to generate  (default: 32)\n"
+        << "  --temperature <T>             Sampling temperature; 0 = greedy  (default: 0)\n"
+        << "  --top-p <P>                   Nucleus sampling cutoff  (default: 0.9)\n"
+        << "  --echo-prompt                 Print the prompt before generated tokens\n"
+        << "  --show-special                Print special tokens instead of stopping silently\n"
+        << "  --generate                    Force the autoregressive loop\n"
+        << "  --chunk-size <N>, --ubatch <N>\n"
+        << "                                Prefill chunk size  (default: 128, 0 = one pass)\n"
+        << "  --device <cpu|cuda>           Execution device  (default: cpu)\n"
+        << "  --threads <N>                 CPU workers  (default: 1)\n"
+        << "  --cuda-graph                  Capture a CUDA graph for decode\n"
+        << "  --unplanned                   Disable arena reuse (debug)\n"
+        << "  --symbol <k=v>                Bind a dynamic dimension (e.g. s=128)\n\n"
+        << "SERVE\n"
+        << "  " << p << " serve <model.gguf> [--paged-kv] [--max-batch <N>]\n"
+        << "               [--gpu-utilization <R>] [--warm-blocks <N>] [--no-prefix-cache]\n"
+        << "               [--device <cpu|cuda>] [--threads <N>] [--cuda-graph]\n"
+        << "               [--chunk-size <N>] [--ubatch <N>]\n\n"
+        << "  Interactive continuous-batching session with optional Driver-VMM paging.\n\n"
+        << "  <model.gguf>                  Compiled GGUF with tokenizer metadata\n"
+        << "  --paged-kv                    Driver-VMM paged KV cache\n"
+        << "  --max-batch <N>               Concurrent requests  (default: 8)\n"
+        << "  --gpu-utilization <R>         Pre-allocate physical blocks to this VRAM fraction\n"
+        << "  --warm-blocks <N>             Warm 2 MB pages to keep  (default: 64)\n"
+        << "  --no-prefix-cache             Disable radix-tree prefix caching\n"
+        << "  --device <cpu|cuda>           Execution device  (default: cpu)\n"
+        << "  --threads <N>                 CPU workers  (default: 1)\n"
+        << "  --cuda-graph                  Multi-bucket CUDA graphs for decode\n"
+        << "  --chunk-size <N>, --ubatch <N>\n"
+        << "                                Prefill chunk size  (default: 128)\n\n"
+        << "RUN\n"
+        << "  " << p << " run <model.gguf> [--image <name:file>] [--text <name:str>]\n"
+        << "             [--input <name:file.bin>] [--output <id:file.bin>]\n"
+        << "             [--state-in <name:file.bin>] [--state-out <name:file.bin>]\n"
+        << "             [--device <cpu|cuda>] [--threads <N>] [--cuda-graph]\n"
+        << "             [--unplanned] [--symbol <k=v>]\n\n"
+        << "  Execute the graph once. Used for classification, embeddings, raw tensors.\n\n"
+        << "  <model.gguf>                  Compiled GGUF\n"
+        << "  --image <name:file>           Preprocess an image onto input tensor <name>\n"
+        << "  --text <name:str>             Tokenize a string onto input tensor <name>\n"
+        << "  --input <name:file.bin>       Load a raw tensor from a binary file\n"
+        << "  --output <id:file.bin>        Write output tensor <id> to a binary file\n"
+        << "  --state-in <name:file.bin>    Load a recurrent state\n"
+        << "  --state-out <name:file.bin>   Save a recurrent state\n"
+        << "  --device <cpu|cuda>           Execution device  (default: cpu)\n"
+        << "  --threads <N>                 CPU workers  (default: 1)\n"
+        << "  --cuda-graph                  Capture a CUDA graph\n"
+        << "  --unplanned                   Disable arena reuse (debug)\n"
+        << "  --symbol <k=v>                Bind a dynamic dimension (e.g. s=128)\n"
+        << std::endl;
 }
 
 static void print_model_info(const std::string& model_path, const ggmlc::SerializedModelGraph& g) {
@@ -203,12 +273,19 @@ int main(int argc, char** argv) {
     }
 
     std::string first_arg = argv[1];
-    if (first_arg == "--help" || first_arg == "-h") {
+    if (first_arg == "--help" || first_arg == "-h" || first_arg == "help") {
         print_help(argv[0]);
         return 0;
     }
+    if (!is_ggmlc_run_command(first_arg)) {
+        std::cerr << "unknown command: " << first_arg << "\n";
+        print_help(argv[0]);
+        return 1;
+    }
+    const std::string command = first_arg;
+    const int argi = 2;
 
-    std::string model_path = first_arg;
+    std::string model_path;
     std::unordered_map<std::string, std::string> input_files;
     std::unordered_map<std::string, std::string> image_files;
     std::unordered_map<std::string, std::string> text_inputs;
@@ -240,21 +317,15 @@ int main(int argc, char** argv) {
     int warm_blocks = 64;
     bool enable_prefix_cache = true;
 
-    for (int i = 2; i < argc; ++i) {
+    for (int i = argi; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--help" || arg == "-h") {
             print_help(argv[0]);
             return 0;
-        } else if (arg == "--info") {
-            show_info = true;
+        } else if (arg == "--model" && i + 1 < argc) {
+            model_path = argv[++i];
         } else if (arg == "--cuda-graph") {
             use_cuda_graph = true;
-        } else if (arg == "--prompt" && i + 1 < argc) {
-            prompt_text = argv[++i];
-            is_generate = true;
-        } else if (arg == "--chat" && i + 1 < argc) {
-            chat_text = argv[++i];
-            is_generate = true;
         } else if (arg == "--system" && i + 1 < argc) {
             system_text = argv[++i];
         } else if (arg == "--generate") {
@@ -322,8 +393,6 @@ int main(int argc, char** argv) {
             unplanned = true;
         } else if (arg == "--paged-kv") {
             use_paged_kv = true;
-        } else if (arg == "--serve") {
-            is_serve_mode = true;
         } else if (arg == "--max-batch" && i + 1 < argc) {
             max_batch = std::stoi(argv[++i]);
         } else if (arg == "--gpu-utilization" && i + 1 < argc) {
@@ -334,7 +403,50 @@ int main(int argc, char** argv) {
             use_paged_kv = true;
         } else if (arg == "--no-prefix-cache") {
             enable_prefix_cache = false;
+        } else if (!arg.empty() && arg[0] != '-') {
+            if (model_path.empty()) {
+                model_path = arg;
+            } else if (command == "chat" && chat_text.empty()) {
+                chat_text = arg;
+                is_generate = true;
+            } else if (command == "prompt" && prompt_text.empty()) {
+                prompt_text = arg;
+                is_generate = true;
+            } else {
+                std::cerr << "unknown argument: " << arg << "\n";
+                print_help(argv[0]);
+                return 1;
+            }
+        } else {
+            std::cerr << "unknown argument: " << arg << "\n";
+            print_help(argv[0]);
+            return 1;
         }
+    }
+
+    if (command == "info") show_info = true;
+    if (command == "serve") is_serve_mode = true;
+    if (command == "chat") {
+        is_generate = true;
+        if (chat_text.empty()) {
+            std::cerr << "Error: chat requires <message>.\n";
+            print_help(argv[0]);
+            return 1;
+        }
+    }
+    if (command == "prompt") {
+        is_generate = true;
+        if (prompt_text.empty()) {
+            std::cerr << "Error: prompt requires <string>.\n";
+            print_help(argv[0]);
+            return 1;
+        }
+    }
+
+    if (model_path.empty()) {
+        std::cerr << "Error: pass <model.gguf>.\n";
+        print_help(argv[0]);
+        return 1;
     }
 
     try {
@@ -363,14 +475,14 @@ int main(int argc, char** argv) {
         if ((!prompt_text.empty() || is_generate) && chat_text.empty() && !model_graph.has_tokenizer()) {
             std::cerr << "[ggmlc-run ERROR] Model '" << model_graph.name
                       << "' does not contain tokenizer metadata for text generation.\n"
-                      << "  Cannot use '--prompt' or '--generate'.\n";
+                      << "  Cannot use 'prompt' or '--generate'.\n";
             return 1;
         }
 
         if (!chat_text.empty()) {
             if (!model_graph.has_tokenizer()) {
                 std::cerr << "[ggmlc-run ERROR] Model '" << model_graph.name
-                          << "' does not contain tokenizer metadata. Cannot use '--chat'.\n";
+                          << "' does not contain tokenizer metadata. Cannot use 'chat'.\n";
                 return 1;
             }
             if (!model_graph.has_chat_template()) {
@@ -390,7 +502,7 @@ int main(int argc, char** argv) {
 
         if (is_serve_mode) {
             if (!has_tokenizer) {
-                std::cerr << "[ggmlc-run ERROR] Model does not contain tokenizer metadata. Cannot use '--serve'.\n";
+                std::cerr << "[ggmlc-run ERROR] Model does not contain tokenizer metadata. Cannot use 'serve'.\n";
                 return 1;
             }
             std::cout << "================================================================================\n"
@@ -404,6 +516,7 @@ int main(int argc, char** argv) {
                       << "  CUDA Graphs:  " << (use_cuda_graph ? "Multi-Bucket (B in {1, 2, 4, 8, 16})" : "Disabled") << "\n"
                       << "================================================================================\n";
             ggmlc::ModelExecutor executor(model_graph, device_name);
+            executor.set_logits_last_only(true);
             executor.init_paged_kv_cache(max_batch, 2048);
             size_t prealloc = 0;
             if (gpu_utilization > 0.0f) {
@@ -431,6 +544,7 @@ int main(int argc, char** argv) {
                 uint64_t req_id = scheduler.add_request(p_tokens, max_tokens, temperature, tokenizer.eos_token_id());
                 std::cout << "[Request #" << req_id << " Queued] (" << p_tokens.size() << " prompt tokens)\n";
 
+                bool flush_per_token = is_stdout_tty();
                 while (scheduler.has_work()) {
                     auto res = scheduler.step();
                     for (const auto& pair : res.new_tokens) {
@@ -440,16 +554,19 @@ int main(int argc, char** argv) {
                         }
                         if (tokenizer.is_special_token(tok)) {
                             if (show_special) {
-                                std::cout << tokenizer.decode({tok}, false) << std::flush;
+                                std::cout << tokenizer.decode({tok}, false);
+                                if (flush_per_token) std::cout << std::flush;
                             }
                             continue;
                         }
-                        std::cout << tokenizer.decode_token(tok, true) << std::flush;
+                        std::cout << tokenizer.decode_token(tok, true);
+                        if (flush_per_token) std::cout << std::flush;
                     }
                     if (!res.completed_request_ids.empty()) {
                         std::cout << "\n[Request Completed]\n";
                     }
                 }
+                std::cout << std::flush;
                 std::cout << "\n> " << std::flush;
             }
             return 0;
@@ -471,6 +588,17 @@ int main(int argc, char** argv) {
 
             uint32_t in_tid = model_graph.inputs[0];
             uint32_t out_tid = model_graph.outputs[0];
+
+            int32_t pos_tid = -1;
+            for (uint32_t inp : model_graph.inputs) {
+                auto it = model_graph.tensors.find(inp);
+                if (it != model_graph.tensors.end()) {
+                    if (it->second.name == "position_ids" || it->second.name.find("pos") != std::string::npos) {
+                        pos_tid = static_cast<int32_t>(inp);
+                        break;
+                    }
+                }
+            }
 
             std::string formatted_prompt;
             bool is_chat_mode = !chat_text.empty();
@@ -502,6 +630,9 @@ int main(int argc, char** argv) {
             if (use_cuda_graph) {
                 executor.set_enable_cuda_graph(true);
             }
+            // Match llama.cpp: only last-token logits for sampling.
+            executor.set_logits_last_only(true);
+            bool flush_per_token = is_stdout_tty();
             auto t_start = std::chrono::high_resolution_clock::now();
             auto t_prefill_end = t_start;
             auto t_decode_start = t_start;
@@ -567,6 +698,16 @@ int main(int argc, char** argv) {
                         }
                     }
                 }
+                if (pos_tid >= 0) {
+                    for (const auto& dim_expr : model_graph.tensors[pos_tid].ne) {
+                        if (dim_expr && dim_expr->type == ggmlc::DimType::SYMBOL) {
+                            int64_t sym_idx = dim_expr->val;
+                            if (sym_idx >= 0 && sym_idx < static_cast<int64_t>(model_graph.symbol_table.size())) {
+                                symbol_env[model_graph.symbol_table[sym_idx]] = c_len;
+                            }
+                        }
+                    }
+                }
 
                 if (use_kv_cache) {
                     symbol_env["pos"] = pos;
@@ -574,6 +715,13 @@ int main(int argc, char** argv) {
 
                 executor.prepare(symbol_env, !unplanned);
                 executor.set_input(in_tid, current_tokens.data() + c_start, c_len * sizeof(int32_t));
+                if (pos_tid >= 0) {
+                    std::vector<int32_t> pos_vec(c_len);
+                    for (int64_t i = 0; i < c_len; ++i) {
+                        pos_vec[i] = static_cast<int32_t>(c_start + i);
+                    }
+                    executor.set_input(pos_tid, pos_vec.data(), c_len * sizeof(int32_t));
+                }
                 executor.run(n_threads);
 
                 if (chunk_idx == n_chunks - 1) {
@@ -583,12 +731,20 @@ int main(int argc, char** argv) {
                     if (max_tokens > 0) {
                         const float* logits_data = static_cast<const float*>(executor.get_output_data(out_tid));
                         size_t total_elements = executor.get_tensor_size_bytes(out_tid) / sizeof(float);
-                        int64_t vocab_size = total_elements / c_len;
-                        if (vocab_size <= 0) {
-                            vocab_size = static_cast<int64_t>(tokenizer.vocab_size());
+                        auto out_shape = executor.get_tensor_shape(out_tid);
+                        int64_t vocab_size = 0;
+                        const float* last_logits = nullptr;
+                        if (out_shape.size() >= 2 && out_shape[1] == 1) {
+                            vocab_size = out_shape[0];
+                            last_logits = logits_data;
+                        } else {
+                            vocab_size = static_cast<int64_t>(total_elements / static_cast<size_t>((c_len > 0) ? c_len : 1));
+                            if (vocab_size <= 0) {
+                                vocab_size = static_cast<int64_t>(tokenizer.vocab_size());
+                            }
+                            last_logits = logits_data + (c_len - 1) * vocab_size;
                         }
 
-                        const float* last_logits = logits_data + (c_len - 1) * vocab_size;
                         int32_t next_token = sample_token(last_logits, vocab_size, temperature, top_p);
 
                         last_token = next_token;
@@ -602,14 +758,16 @@ int main(int argc, char** argv) {
                         }
                         if (tokenizer.is_special_token(next_token)) {
                             if (show_special) {
-                                std::cout << tokenizer.decode({next_token}, false) << std::flush;
+                                std::cout << tokenizer.decode({next_token}, false);
+                                if (flush_per_token) std::cout << std::flush;
                             }
                             stopped = true;
                             break;
                         }
 
                         std::string piece = tokenizer.decode_token(next_token, true);
-                        std::cout << piece << std::flush;
+                        std::cout << piece;
+                        if (flush_per_token) std::cout << std::flush;
                     }
                 }
             }
@@ -635,6 +793,16 @@ int main(int argc, char** argv) {
                         }
                     }
                 }
+                if (pos_tid >= 0) {
+                    for (const auto& dim_expr : model_graph.tensors[pos_tid].ne) {
+                        if (dim_expr && dim_expr->type == ggmlc::DimType::SYMBOL) {
+                            int64_t sym_idx = dim_expr->val;
+                            if (sym_idx >= 0 && sym_idx < static_cast<int64_t>(model_graph.symbol_table.size())) {
+                                symbol_env[model_graph.symbol_table[sym_idx]] = S;
+                            }
+                        }
+                    }
+                }
 
                 if (use_kv_cache) {
                     symbol_env["pos"] = pos;
@@ -646,16 +814,27 @@ int main(int argc, char** argv) {
                 } else {
                     executor.set_input(in_tid, current_tokens.data(), current_tokens.size() * sizeof(int32_t));
                 }
+                if (pos_tid >= 0) {
+                    int32_t cur_pos = static_cast<int32_t>(pos);
+                    executor.set_input(pos_tid, &cur_pos, sizeof(int32_t));
+                }
                 executor.run(n_threads);
 
                 const float* logits_data = static_cast<const float*>(executor.get_output_data(out_tid));
                 size_t total_elements = executor.get_tensor_size_bytes(out_tid) / sizeof(float);
-                int64_t vocab_size = total_elements / S;
-                if (vocab_size <= 0) {
-                    vocab_size = static_cast<int64_t>(tokenizer.vocab_size());
+                auto out_shape = executor.get_tensor_shape(out_tid);
+                int64_t vocab_size = 0;
+                const float* last_logits = nullptr;
+                if (out_shape.size() >= 2 && out_shape[1] == 1) {
+                    vocab_size = out_shape[0];
+                    last_logits = logits_data;
+                } else {
+                    vocab_size = static_cast<int64_t>(total_elements / static_cast<size_t>((S > 0) ? S : 1));
+                    if (vocab_size <= 0) {
+                        vocab_size = static_cast<int64_t>(tokenizer.vocab_size());
+                    }
+                    last_logits = logits_data + (S - 1) * vocab_size;
                 }
-
-                const float* last_logits = logits_data + (S - 1) * vocab_size;
                 int32_t next_token = sample_token(last_logits, vocab_size, temperature, top_p);
 
                 last_token = next_token;
@@ -670,15 +849,18 @@ int main(int argc, char** argv) {
                 }
                 if (tokenizer.is_special_token(next_token)) {
                     if (show_special) {
-                        std::cout << tokenizer.decode({next_token}, false) << std::flush;
+                        std::cout << tokenizer.decode({next_token}, false);
+                        if (flush_per_token) std::cout << std::flush;
                     }
                     break;
                 }
 
                 std::string piece = tokenizer.decode_token(next_token, true);
-                std::cout << piece << std::flush;
+                std::cout << piece;
+                if (flush_per_token) std::cout << std::flush;
             }
 
+            std::cout << std::flush;
             auto t_end = std::chrono::high_resolution_clock::now();
             double total_sec = std::chrono::duration<double>(t_end - t_start).count();
             double prefill_sec = std::chrono::duration<double>(t_prefill_end - t_start).count();
@@ -707,6 +889,7 @@ int main(int argc, char** argv) {
         if (use_cuda_graph) {
             executor.set_enable_cuda_graph(true);
         }
+        executor.set_logits_last_only(true);
         executor.prepare(symbol_env, !unplanned);
 
         // Load initial state data if provided

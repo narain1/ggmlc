@@ -55,9 +55,7 @@ from examples.benchmarks.graph_compare import (
     compare_with_llamacpp,
 )
 from examples.models.hub_models import (
-    load_bert_model,
     load_gpt2_model,
-    load_minilm_model,
     load_qwen_model,
     load_smollm2_model,
 )
@@ -91,10 +89,6 @@ GGUF_HUB_REGISTRY: dict[str, tuple[str, str]] = {
     "gpt2": (
         "QuantFactory/gpt2-GGUF",
         "gpt2.Q8_0.gguf",
-    ),
-    "minilm_l6": (
-        "second-state/All-MiniLM-L6-v2-Embedding-GGUF",
-        "all-MiniLM-L6-v2-Q8_0.gguf",
     ),
 }
 
@@ -239,6 +233,7 @@ class LlamaCppComparisonSuite:
         warmup: int = 2,
         runs: int = 5,
         quantize: str | None = None,
+        unplanned: bool = False,
         prefill_seq_lens: list[int] | None = None,
         verbose: bool = False,
     ):
@@ -246,6 +241,7 @@ class LlamaCppComparisonSuite:
         self.warmup = warmup
         self.runs = runs
         self.quantize = quantize.lower() if quantize else None
+        self.unplanned = unplanned
         self.prefill_seq_lens = prefill_seq_lens or [16, 64, 128, 256]
         self.verbose = verbose
         self.hardware_info = get_hardware_info(self.backend)
@@ -358,9 +354,10 @@ class LlamaCppComparisonSuite:
                     for x in example_inputs
                 ]
 
-                # Warmup
-                for _ in range(self.warmup):
-                    runner(*np_inputs)
+                # Warmup / prepare context and inputs
+                warmup_count = max(self.warmup, 1)
+                for _ in range(warmup_count):
+                    runner(*np_inputs, enable_arena_reuse=not self.unplanned)
 
             # 2. Steady-state Single-Token Decode Latency
             decode_latencies = runner.run_benchmark(runs=self.runs)
@@ -398,7 +395,7 @@ class LlamaCppComparisonSuite:
                         ]
                         # Warmup
                         for _ in range(1):
-                            seq_runner(*seq_np_in)
+                            seq_runner(*seq_np_in, enable_arena_reuse=not self.unplanned)
 
                         latencies = seq_runner.run_benchmark(runs=self.runs)
                         avg_ms = float(np.mean(latencies))
@@ -555,12 +552,6 @@ class LlamaCppComparisonSuite:
             ("smollm2_135m", "smollm2_135m", lambda seq_len=8: load_smollm2_model(seq_len=seq_len)),
             ("qwen2.5_0.5b", "qwen2.5_0.5b", lambda seq_len=8: load_qwen_model(seq_len=seq_len)),
             ("gpt2", "gpt2", lambda seq_len=8: load_gpt2_model(seq_len=seq_len)),
-            (
-                "bert_base_uncased",
-                "bert_base",
-                lambda seq_len=16: load_bert_model(seq_len=seq_len),
-            ),
-            ("minilm_l6", "bert_base", lambda seq_len=16: load_minilm_model(seq_len=seq_len)),
         ]
 
         for name, arch_key, factory in models_to_run:
@@ -702,6 +693,11 @@ def main():
     )
     parser.add_argument("--warmup", type=int, default=2, help="Number of warmup iterations")
     parser.add_argument("--runs", type=int, default=5, help="Number of measurement runs")
+    parser.add_argument(
+        "--unplanned",
+        action="store_true",
+        help="Disable memory arena reuse planning (for debugging)",
+    )
     parser.add_argument("--verbose", action="store_true", help="Print verbose compilation output")
     parser.add_argument(
         "--output-md",
@@ -722,6 +718,7 @@ def main():
         warmup=args.warmup,
         runs=args.runs,
         quantize=args.quantize,
+        unplanned=args.unplanned,
         verbose=args.verbose,
     )
     suite.run_all(selected_models=args.models)

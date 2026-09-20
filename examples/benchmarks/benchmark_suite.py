@@ -172,20 +172,32 @@ from examples.models.hub_models import (
     load_vit_model,
     load_whisper_model,
 )
-from examples.models.keras_models import (
-    load_keras_convnext_tiny,
-    load_keras_densenet121,
-    load_keras_efficientnet_b0,
-    load_keras_mobilenet_v3_large,
-    load_keras_mobilenet_v3_small,
-    load_keras_resnet50,
-)
-from examples.models.kerashub_models import (
-    load_kerashub_bert,
-    load_kerashub_distilbert,
-    load_kerashub_gemma3,
-    load_kerashub_gpt2,
-)
+
+try:
+    from examples.models.keras_models import (
+        load_keras_convnext_tiny,
+        load_keras_densenet121,
+        load_keras_efficientnet_b0,
+        load_keras_mobilenet_v3_large,
+        load_keras_mobilenet_v3_small,
+        load_keras_resnet50,
+    )
+
+    _KERAS_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    _KERAS_AVAILABLE = False
+
+try:
+    from examples.models.kerashub_models import (
+        load_kerashub_bert,
+        load_kerashub_distilbert,
+        load_kerashub_gemma3,
+        load_kerashub_gpt2,
+    )
+
+    _KERASHUB_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    _KERASHUB_AVAILABLE = False
 
 
 @dataclass
@@ -213,12 +225,18 @@ class BenchmarkSuite:
     """Orchestrates end-to-end benchmarking across model families."""
 
     def __init__(
-        self, backend: str = "cpu", warmup: int = 3, runs: int = 10, verbose: bool = False
+        self,
+        backend: str = "cpu",
+        warmup: int = 3,
+        runs: int = 10,
+        verbose: bool = False,
+        fusion_options: Any = None,
     ):
         self.backend = backend.lower()
         self.warmup = warmup
         self.runs = runs
         self.verbose = verbose
+        self.fusion_options = fusion_options
         self.records: list[BenchmarkRecord] = []
         self.hardware_metadata = get_hardware_metadata(self.backend)
 
@@ -254,7 +272,7 @@ class BenchmarkSuite:
                     export_time_ms = (time.perf_counter() - t_exp_0) * 1000.0
 
                     t_low_0 = time.perf_counter()
-                    ggml_graph = lower_to_ggml(exported_graph)
+                    ggml_graph = lower_to_ggml(exported_graph, fusion_options=self.fusion_options)
                     ser_bytes = serialize_ggml_graph(ggml_graph)
                     lowering_time_ms = (time.perf_counter() - t_low_0) * 1000.0
                     payload_size_mb = len(ser_bytes) / (1024.0 * 1024.0)
@@ -267,11 +285,18 @@ class BenchmarkSuite:
                         ref_out = model(*example_inputs)
 
                     t_exp_0 = time.perf_counter()
-                    exported = export_torch_model(model, example_inputs, model_name=name)
+                    exported = export_torch_model(
+                        model,
+                        example_inputs,
+                        model_name=name,
+                        fusion_options=self.fusion_options,
+                    )
                     export_time_ms = (time.perf_counter() - t_exp_0) * 1000.0
 
                     t_low_0 = time.perf_counter()
-                    ggml_graph = lower_to_ggml(exported.main_graph)
+                    ggml_graph = lower_to_ggml(
+                        exported.main_graph, fusion_options=self.fusion_options
+                    )
                     ser_bytes = serialize_ggml_graph(ggml_graph)
                     lowering_time_ms = (time.perf_counter() - t_low_0) * 1000.0
                     payload_size_mb = len(ser_bytes) / (1024.0 * 1024.0)
@@ -514,23 +539,35 @@ class BenchmarkSuite:
                 "Audio-Seq2Seq",
                 lambda: load_whisper_model(component="decoder"),
             ),
-            # 7. JAX / Keras 3 Production Models
-            ("keras_mobilenet_v3_small", "JAX-Vision", load_keras_mobilenet_v3_small),
-            ("keras_mobilenet_v3_large", "JAX-Vision", load_keras_mobilenet_v3_large),
-            ("keras_resnet50", "JAX-Vision", load_keras_resnet50),
-            ("keras_convnext_tiny", "JAX-Vision", load_keras_convnext_tiny),
-            ("keras_densenet121", "JAX-Vision", load_keras_densenet121),
-            ("keras_efficientnet_b0", "JAX-Vision", load_keras_efficientnet_b0),
+            # 7. JAX / Flax Production Models
             ("flax_vit_b16", "JAX-Vision", load_flax_vit_b16),
-            ("kerashub_bert", "JAX-NLP", load_kerashub_bert),
-            ("kerashub_distilbert", "JAX-NLP", load_kerashub_distilbert),
-            ("kerashub_gpt2", "JAX-SLM", load_kerashub_gpt2),
-            ("kerashub_gemma3", "JAX-SLM", load_kerashub_gemma3),
             # 8. Multimodal Vision-Language Models
             ("clip_vision_vit_b32", "Multimodal-Vision", load_clip_vision_model),
             ("clip_text_transformer", "Multimodal-Text", load_clip_text_model),
             ("clip_multimodal_similarity", "Multimodal-E2E", load_clip_full_model),
         ]
+
+        if _KERAS_AVAILABLE:
+            all_models.extend(
+                [
+                    ("keras_mobilenet_v3_small", "JAX-Vision", load_keras_mobilenet_v3_small),
+                    ("keras_mobilenet_v3_large", "JAX-Vision", load_keras_mobilenet_v3_large),
+                    ("keras_resnet50", "JAX-Vision", load_keras_resnet50),
+                    ("keras_convnext_tiny", "JAX-Vision", load_keras_convnext_tiny),
+                    ("keras_densenet121", "JAX-Vision", load_keras_densenet121),
+                    ("keras_efficientnet_b0", "JAX-Vision", load_keras_efficientnet_b0),
+                ]
+            )
+
+        if _KERASHUB_AVAILABLE:
+            all_models.extend(
+                [
+                    ("kerashub_bert", "JAX-NLP", load_kerashub_bert),
+                    ("kerashub_distilbert", "JAX-NLP", load_kerashub_distilbert),
+                    ("kerashub_gpt2", "JAX-SLM", load_kerashub_gpt2),
+                    ("kerashub_gemma3", "JAX-SLM", load_kerashub_gemma3),
+                ]
+            )
 
         for name, category, loader in all_models:
             if selected_models and name not in selected_models:
@@ -632,6 +669,11 @@ class BenchmarkSuite:
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(description="GGMLC Benchmark Suite")
     parser.add_argument(
         "--backend",
@@ -652,10 +694,33 @@ def main():
     parser.add_argument(
         "--output-json", type=str, default="benchmark_report.json", help="JSON output path"
     )
+    parser.add_argument(
+        "--fusion-no-bake-affine",
+        action="store_true",
+        help="Disable compile-time const-affine / LayerNorm bake into Linear/Conv",
+    )
+    parser.add_argument(
+        "--fusion-no-bake-rms",
+        action="store_true",
+        help="Disable compile-time RMSNorm gamma bake into Linear",
+    )
     args = parser.parse_args()
 
+    fusion_options = None
+    if args.fusion_no_bake_affine or args.fusion_no_bake_rms:
+        from ggmlc.transforms.fusion import FusionOptions
+
+        fusion_options = FusionOptions(
+            enable_bake_affine=not args.fusion_no_bake_affine,
+            enable_bake_rms_into_linear=not args.fusion_no_bake_rms,
+        )
+
     suite = BenchmarkSuite(
-        backend=args.backend, warmup=args.warmup, runs=args.runs, verbose=args.verbose
+        backend=args.backend,
+        warmup=args.warmup,
+        runs=args.runs,
+        verbose=args.verbose,
+        fusion_options=fusion_options,
     )
     suite.run_all(selected_models=args.models)
 

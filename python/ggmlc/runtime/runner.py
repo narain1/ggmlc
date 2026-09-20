@@ -138,6 +138,20 @@ class ModelRunner:
                                     if sym not in symbol_env:
                                         symbol_env[sym] = int(dim_val)
 
+        # GGUF-loaded graphs have no py_graph; bind GGML ne[i] -> numpy axis -1-i.
+        if args and self.symbol_table and hasattr(args[0], "shape"):
+            tid0 = self.inputs[0] if self.inputs else None
+            t0 = self.tensor_info.get(tid0) if tid0 is not None else None
+            if t0 is not None and hasattr(t0, "symbol_index"):
+                arr_shape = args[0].shape
+                for i in range(min(4, len(arr_shape))):
+                    sidx = int(t0.symbol_index(i))
+                    if 0 <= sidx < len(self.symbol_table):
+                        np_axis = len(arr_shape) - 1 - i
+                        name = self.symbol_table[sidx]
+                        if name not in symbol_env:
+                            symbol_env[name] = int(arr_shape[np_axis])
+
         # Fallback if symbols passed and count matches symbol_table
         if symbols and len(self.symbol_table) == len(symbols):
             for reg_sym, val in zip(self.symbol_table, symbols.values()):
@@ -156,6 +170,7 @@ class ModelRunner:
         self.executor.prepare(symbol_env, enable_arena_reuse)
 
         # 2. Bind positional inputs
+        self._cached_inputs = []
         for idx, arr in enumerate(args):
             if idx >= len(self.inputs):
                 raise ValueError(
@@ -167,6 +182,7 @@ class ModelRunner:
             if t and t.type == int(GGMLType.GGML_TYPE_I32) and arr_c.dtype == np.int64:
                 arr_c = arr_c.astype(np.int32)
             self.executor.set_input_by_id(tid, arr_c)
+            self._cached_inputs.append((tid, arr_c))
 
         # 3. Bind keyword inputs
         for name, arr in kwargs.items():
@@ -177,12 +193,14 @@ class ModelRunner:
                 if t and t.type == int(GGMLType.GGML_TYPE_I32) and arr_c.dtype == np.int64:
                     arr_c = arr_c.astype(np.int32)
                 self.executor.set_input_by_id(tid, arr_c)
+                self._cached_inputs.append((tid, arr_c))
             elif len(self.inputs) == 1 and len(kwargs) == 1:
                 tid = self.inputs[0]
                 t = self.tensor_info.get(tid)
                 if t and t.type == int(GGMLType.GGML_TYPE_I32) and arr_c.dtype == np.int64:
                     arr_c = arr_c.astype(np.int32)
                 self.executor.set_input_by_id(tid, arr_c)
+                self._cached_inputs.append((tid, arr_c))
             else:
                 self.executor.set_input_by_name(name, arr_c)
 
@@ -237,15 +255,13 @@ class ModelRunner:
 
         threads = n_threads if n_threads is not None else self.n_threads
         latencies: list[float] = []
-        is_cuda = self.device.startswith("cuda")
         for _ in range(runs):
+            # Refresh input buffers before each run to ensure valid data on device
+            if hasattr(self, "_cached_inputs"):
+                for tid, arr_c in self._cached_inputs:
+                    self.executor.set_input_by_id(tid, arr_c)
             t0 = time.perf_counter()
             self.executor.run(threads)
-            if is_cuda:
-                import torch
-
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
             t1 = time.perf_counter()
             latencies.append((t1 - t0) * 1000.0)
         return latencies

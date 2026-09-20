@@ -35,7 +35,7 @@ Deploying modern neural networks on edge devices, CPU servers, and GPU systems o
 4. **Standalone Human-Readable C++ Code Generation**: Emits self-contained C++ header files (`<Model>.h`), native entry points (`ggmlc_main.cpp`), and `CMakeLists.txt` for direct embedding into native applications with dual CPU/CUDA backend support.
 5. **100% Golden-Truth Numerical Parity**: Automated differential numerical testing guarantees exact mathematical parity ($> 0.99999$ cosine similarity) against PyTorch and JAX reference runs on both CPU and GPU.
 6. **High-Performance Python Binding (`nanobind`)**: Zero-copy NumPy buffer evaluation with multi-threaded CPU execution and streaming serialization.
-7. **Hardware-Accelerated Persistent KV Cache**: Dedicated zero-copy device key/value buffers with dual-phase prefill and single-token decode ($S=1$), delivering constant $O(1)$ inter-token decode latency (~15.6–16.3 ms/tok on CUDA, up to 64.1 tok/s) across arbitrary sequence lengths (32, 64, 128, 256+ tokens), outperforming `llama.cpp`.
+7. **Hardware-Accelerated Persistent KV Cache**: Decode/prefill write K/V with `ggml_set_rows` into padded `(s, n_kv)` graph buckets (llama `can_reuse` analogue) so GGML CUDA graphs stay warm. Last-token logits gather matches llama `n_outputs=1`. On RTX 4050 Q8_0: SmolLM2/Qwen/LLaMA/GPT-2 Medium **pp512–1024 ≥1.03×–1.16×** vs `llama.cpp`; decode **1.01×–1.37×**.
 8. **High-Throughput Agent Serving & Driver-VMM Paged KV Cache**: GPU MMU virtual memory paging (`cuMemMap`) allocates physical 2 MB pages on demand with **zero bandwidth penalty** (41.77 GB/s), pointer invariance across dynamic expansions, immediate physical VRAM reclamation, and multi-bucket CUDA graphs ($B \in \{1, 2, 4, 8, 16\}$) for iteration-level continuous batching.
 9. **Radix Tree Automated Prefix Caching & Warm Block Pool**: Token-sequence prefix matching via CPU trie directly maps cached physical pages into contiguous virtual slots via `cuMemMap`, skipping prefill for shared prompt prefixes with **zero custom attention kernels**, while elastic warm-pool recycling minimizes OS driver syscalls.
 
@@ -57,7 +57,7 @@ graph TD
     subgraph Passes["3. Compile-Time Optimization Passes"]
         CF["Constant Folding"]
         DCE["Dead Code Elimination"]
-        FUS["Pattern-Based Operator Fusion<br/><i>(Conv+ReLU, SwiGLU, LayerNorm, RMSNorm)</i>"]
+        FUS["Pattern-Based Operator Fusion<br/><i>(Conv+ReLU, SwiGLU, RMS/LN bake, const-affine→Linear/Conv)</i>"]
         PRN["Redundant Cast & Permute Pruning"]
     end
 
@@ -89,6 +89,14 @@ graph TD
     class GGML target;
     class GGUF,CPP deploy;
 ```
+
+---
+
+## 📰 News
+
+**Sep 20, 2026 — ggmlc can Laya.** Compile [Laya](https://huggingface.co/convaiinnovations/laya), the open-source alternative to TypeSafe Jev, into a standalone C++ System 1 engine: typed `choice` / `score` / `noul` questions scored in one encoder pass — no generated tokens. English ModernBERT-large, mmBERT multilingual, and the typed-decisions specialist ship as F16 / Q8_0 / UD_Q4_K_M GGUFs. On an RTX 4050 Laptop, **~25 ms** per decision and **~143 ms** for a 7-question email preset. Details, CLI, and downloads: [`examples/laya`](examples/laya/README.md).
+
+**Sep 19, 2026 — Prefill and decode at llama.cpp parity.** A full `ggmlc-bench` vs `llama-bench` matrix (Q8_0, ubatch 512, CUDA graph, RTX 4050 Laptop) lands **31/32** cells at ≥ **1.01×** vs official `llama.cpp` — Qwen2.5-0.5B pp1024 **1.16×**, SmolLM2-360M tg32 **1.19×**, LLaMA-3.2-1B decode **1.07×**. Compiler-generated graphs, not hand-written model C++. Write-up and tables: [`docs/benchmarks/ggmlc_vs_llama_cpp.md`](docs/benchmarks/ggmlc_vs_llama_cpp.md).
 
 ---
 
@@ -210,47 +218,65 @@ print("Generated text:", text)
 
 ```bash
 # 1. Inspect model metadata, tensor graph, dynamic symbols, and detected capabilities
-./ggmlc-run model.gguf --info
+./ggmlc-run info model.gguf
 
 # 2. Clean instruction chat streaming with automatic template application & KV cache
-./ggmlc-run smollm2_chat.gguf --chat "What is the capital of France?" --threads 4
+./ggmlc-run chat smollm2_chat.gguf "What is the capital of France?" --threads 4
 
 # 3. Offload autoregressive chat inference to NVIDIA CUDA GPU with CUDA graph capture & chunked prefill
-./ggmlc-run smollm2_chat.gguf --chat "Explain quantum computing in one sentence." --device cuda --cuda-graph --chunk-size 128 --max-tokens 256
+./ggmlc-run chat smollm2_chat.gguf "Explain quantum computing in one sentence." --device cuda --cuda-graph --chunk-size 128 --max-tokens 256
 
 # 4. Multimodal image preprocessing & task-aware classification
-./ggmlc-run resnet50.gguf --image x:cat.jpg --threads 4
+./ggmlc-run run resnet50.gguf --image x:cat.jpg --threads 4
 ```
 
-#### Autoregressive KV Cache Benchmark: `ggmlc-run` vs. `llama.cpp` (SmolLM2-135M)
+#### Autoregressive decode + prefill vs `llama-bench` (RTX 4050, Q8_0)
 
-| Sequence Length | Target Device | `llama.cpp` Latency | `ggmlc-run` Latency | `ggmlc-run` Decode Rate | vs `llama.cpp` | Latency Scaling |
-| :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **32 tokens** | **CUDA GPU** | 15.43 ms/tok | **13.46 ms/tok** | **74.3 tok/s** | **1.15x faster** | **$O(1)$ Flat** |
-| **64 tokens** | **CUDA GPU** | 18.93 ms/tok | **12.40 ms/tok** | **80.7 tok/s** | **1.53x faster** | **$O(1)$ Flat** |
-| **128 tokens** | **CUDA GPU** | 19.06 ms/tok | **12.50 ms/tok** | **80.0 tok/s** | **1.52x faster** | **$O(1)$ Flat** |
-| **256 tokens** | **CUDA GPU** | 18.21 ms/tok | **12.05 ms/tok** | **83.0 tok/s** | **1.51x faster** | **$O(1)$ Flat** |
-| **32 tokens** | **CPU (4 Threads)** | 22.35 ms/tok | **16.30 ms/tok** | **61.3 tok/s** | **1.37x faster** | **$O(1)$ Flat** |
-| **64 tokens** | **CPU (4 Threads)** | 16.18 ms/tok | **14.92 ms/tok** | **67.0 tok/s** | **1.08x faster** | **$O(1)$ Flat** |
-| **128 tokens** | **CPU (4 Threads)** | 15.54 ms/tok | **15.37 ms/tok** | **65.1 tok/s** | **1.01x faster** | **$O(1)$ Flat** |
-| **256 tokens** | **CPU (4 Threads)** | 13.81 ms/tok | **13.73 ms/tok** | **72.8 tok/s** | **1.01x faster** | **$O(1)$ Flat** |
+After `ggml_set_rows` KV writes, padded `n_kv`, strided fused-QKV `VIEW→RESHAPE`, `(s, n_kv)` graph buckets, and **last-token logits gather** (llama `n_outputs=1`):
+
+| Model | test | `ggmlc` | `llama.cpp` | Ratio |
+| :--- | :--- | ---: | ---: | ---: |
+| **SmolLM2-360M** | pp512 | **9900** | 9233 | **1.07x** |
+| **SmolLM2-360M** | pp1024 | **9940** | 9293 | **1.07x** |
+| **SmolLM2-360M** | tg32 | **160.6** | 134.6 | **1.19x** |
+| **Qwen2.5-0.5B** | pp512 | **9689** | 8953 | **1.08x** |
+| **Qwen2.5-0.5B** | pp1024 | **9772** | 8417 | **1.16x** |
+| **Qwen2.5-0.5B** | tg32 | **159.8** | 116.2 | **1.37x** |
+| **GPT-2 Medium** | pp512 | **9080** | 8613 | **1.05x** |
+| **GPT-2 Medium** | pp1024 | **9139** | 8897 | **1.03x** |
+| **LLaMA-3.2-1B** | pp512 | **5138** | 4876 | **1.05x** |
+| **LLaMA-3.2-1B** | pp1024 | **5701** | 5414 | **1.05x** |
+| **LLaMA-3.2-1B** | tg32 | **93.1** | 87.1 | **1.07x** |
+
+Full matrix (all $P$, tg32/tg64): **31/32** cells ≥ **1.01×** vs `llama.cpp` (only GPT-2 `pp16` at 0.92×). End-to-end chat turns (`--e2e` / `-pg`, $N=128$): **~1.0x–1.3x**. Details: [docs/benchmarks/ggmlc_vs_llama_cpp.md](docs/benchmarks/ggmlc_vs_llama_cpp.md).
+
+```bash
+# Throughput matrix (pp / tg separately)
+python examples/benchmarks/compare_ggmlc_vs_llama_cpp.py --backend cuda --cuda-graph --ubatch 512 --runs 5
+
+# End-to-end wall clock (prefill + decode in one timed shot)
+python examples/benchmarks/compare_ggmlc_vs_llama_cpp.py --backend cuda --cuda-graph --e2e --skip-numerical-check
+```
 
 ---
 
 ### 8. GGMLC vs. `llama.cpp`: Computation Graph & Architectural Comparison
 
-A comprehensive comparison across shared architectures (`SmolLM2-135M`, `Qwen 2.5 0.5B`, `Gemma 3`, `GPT-2`, and `BERT-Base`):
+A comprehensive comparison across shared architectures (`SmolLM2-135M`, `SmolLM2-360M`, `Qwen 2.5 0.5B`, `Qwen 2.5 1.5B`, `GPT-2`, and `BERT-Base`) using native standalone C++ benchmark tools (`ggml-bench` vs `llama-bench`):
 
 ```bash
-# Run the GGMLC vs llama.cpp comparison suite across shared architectures
-python examples/benchmarks/benchmark_llama_cpp_comparison.py --backend cpu --runs 5 --warmup 2
+# 1. Run the unified apples-to-apples comparative benchmark suite
+python examples/benchmarks/compare_ggmlc_vs_llama_cpp.py --backend cpu --models smollm2_135m,gpt2 --runs 5
+
+# 2. Standalone C++ benchmark binary execution (zero Python wrapper/sampling overhead)
+./ggml-bench model.gguf -p 16,64,128 -n 32,64 -r 5 -o md
 ```
 
 | Architecture | Model | ggmlc GEMV/tok | llama.cpp GEMV/tok | Kernel Launch Reduction | Memory Strategy | CUDA Graph Support |
 | :--- | :--- | :---: | :---: | :---: | :--- | :--- |
 | **SmolLM2 / LLaMA** | `smollm2_135m` | **121** | 211 | **-42.7%** | Planned Arena + Driver-VMM | Unified (CC $\ge 6.0$, Pascal to Blackwell) |
-| **Qwen 2.5** | `qwen2.5_0.5b` | **97** | 169 | **-42.6%** | Planned Arena + Driver-VMM | Unified (CC $\ge 6.0$, Pascal to Blackwell) |
-| **GPT-2** | `gpt2` | **37** | 49 | **-24.5%** | Planned Arena + Driver-VMM | Unified (CC $\ge 6.0$, Pascal to Blackwell) |
+| **Qwen 2.5** | `qwen2.5_0.5b` | **97** | 169 | **-41.2%** | Planned Arena + Driver-VMM | Unified (CC $\ge 6.0$, Pascal to Blackwell) |
+| **GPT-2** | `gpt2` | **37** | 49 | **-24.5%** | Planned Arena | Unified (CC $\ge 6.0$, Pascal to Blackwell) |
 | **BERT / MiniLM** | `minilm_l6` | **49** | 73 | **-32.9%** | Planned Arena + Driver-VMM | Unified (CC $\ge 6.0$, Pascal to Blackwell) |
 
 > 📖 **Deep-Dive Architectural Report**: See [docs/benchmarks/ggmlc_vs_llama_cpp.md](docs/benchmarks/ggmlc_vs_llama_cpp.md) for detailed structural proofs, operator breakdown tables, and Colab GPU reproduction instructions.
@@ -499,14 +525,19 @@ pytest -v
 
 `ggmlc` includes production-grade standalone C++ applications under [`examples/`](examples/), demonstrating end-to-end neural compilation, domain math, and multi-backend acceleration:
 
-1. **[Tab Completion Engine (`examples/tab_completion`)](examples/tab_completion/README.md)**:
+1. **[Laya System 1 Decision Engine (`examples/laya`)](examples/laya/README.md)**:
+   - Local open-weight reproduction of Jev-style **System 1** decisions: typed `choice` / `score` / `noul` questions scored in one parallel pass. English ModernBERT-large 421M, plus mmBERT multilingual and the typed-decisions specialist.
+   - Domain pipeline in C++: Laya `build_sequence`, temperatures, Shannon confidence, `--device auto`, language routing (`--models-dir`), stdin JSON-RPC (`daemon`), and an embedded Decision Studio with a question-builder form + `POST /api/decide` (`serve`).
+   - GGUFs: [mys/laya-GGUF](https://huggingface.co/mys/laya-GGUF) · [mys/laya-multilingual-GGUF](https://huggingface.co/mys/laya-multilingual-GGUF) · [mys/laya-typed-decisions-GGUF](https://huggingface.co/mys/laya-typed-decisions-GGUF). Binaries: [GitHub `latest` release](https://github.com/monatis/ggmlc/releases/latest) (macOS Metal, Linux/Windows CUDA sm80/sm86/sm89).
+   - RTX 4050 Laptop: **~25 ms** / decision (`laya.exe` CUDA, pad-to-live S=84) and **~143 ms** for a 7-question email preset (one `B=7, S=124` forward). Official PyTorch Agent is 57 ms / 143 ms. No autoregressive tokens.
+2. **[Tab Completion Engine (`examples/tab_completion`)](examples/tab_completion/README.md)**:
    - 100% offline continuous latent diffusion code autocompletion engine powered by **PlaidQ**.
    - Pure mathematical Fill-In-The-Middle (FIM) without prompt tagging hacks.
-   - Non-causal bidirectional transformer trunk, static 256-canvas CUDA Graph capture, OpenMP parallel hole-selective sampler, and persistent JSON-RPC IDE daemon (`--daemon`).
-2. **[Google TimesFM 3.0 Foundation Forecaster (`examples/timesfm`)](examples/timesfm/README.md)**:
+   - Non-causal bidirectional transformer trunk, static 256-canvas CUDA Graph capture, OpenMP parallel hole-selective sampler, and persistent JSON-RPC IDE daemon (`daemon`).
+3. **[Google TimesFM 3.0 Foundation Forecaster (`examples/timesfm`)](examples/timesfm/README.md)**:
    - Standalone zero-dependency C++ engine for Google TimesFM 3.0 foundation time-series forecasting.
    - 20-layer mixing transformer with Pax-style normalization, RoPE, and dynamic sequence dimensions.
-   - Statistical domain suite: RevIN normalization, linear detrending ($R^2 \ge 0.5$), quantile monotonicity sorting, rolling backtesting engine with calibration scoring (`coverage_80`, `coverage_40`, `naive_mae_ratio`), multi-band SVG visualizer, and single-binary embedded Web Studio & REST API (`--serve`).
+   - Statistical domain suite: RevIN normalization, linear detrending ($R^2 \ge 0.5$), quantile monotonicity sorting, rolling backtesting engine with calibration scoring (`coverage_80`, `coverage_40`, `naive_mae_ratio`), multi-band SVG visualizer, and single-binary embedded Web Studio & REST API (`serve`).
 
 ---
 

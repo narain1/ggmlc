@@ -20,6 +20,7 @@ class FusionOptions:
     """Configuration options for enabling or disabling individual fusion passes."""
 
     enable_bias_gelu: bool = True
+    enable_approx_gelu: bool = True
     enable_layer_norm: bool = True
     enable_rms_norm: bool = True
     enable_swiglu: bool = True
@@ -28,6 +29,17 @@ class FusionOptions:
     enable_horizontal_mlp: bool = True
     enable_horizontal_qkv: bool = True
     enable_rope: bool = True
+    enable_sdpa_transpose: bool = True
+    # Bake RMSNorm gamma into following Linear weight columns at compile time,
+    # then emit weightless RMS_NORM. Removes the post-norm MUL (and gamma tensor)
+    # without new CUDA kernels. Must run after horizontal fusion; quantize sees
+    # already-scaled W. Default ON after SmolLM/Qwen/LLaMA A/B (stable, often faster).
+    enable_bake_rms_into_linear: bool = True
+    # Generic const-affine (MUL/DIV/ADD/SUB) and LayerNorm γ/β folding into
+    # Linear / MatMul / Conv2D weights. Same family as RMS bake; default ON.
+    # Skips QK-Norm (norm→RoPE) and peri-norm residual (norm→residual ADD) so
+    # stock CUDA fused kernels stay intact.
+    enable_bake_affine: bool = True
 
 
 class OperatorFusionPass(Pass):
@@ -87,13 +99,63 @@ def fuse_operations(graph: Graph, options: FusionOptions | None = None) -> Graph
     if options.enable_swiglu:
         _fuse_swiglu_patterns(graph)
 
+    if options.enable_approx_gelu or options.enable_bias_gelu:
+        _fuse_approx_gelu_patterns(graph)
+
     if options.enable_bias_gelu:
         _fuse_bias_gelu_patterns(graph)
 
     if options.enable_horizontal_mlp or options.enable_horizontal_qkv:
+        import os
+
+        if os.environ.get("GGMLC_DEBUG_FUSION"):
+            print(
+                f"[fusion] horizontal mlp={options.enable_horizontal_mlp} "
+                f"qkv={options.enable_horizontal_qkv}",
+                flush=True,
+            )
         _fuse_horizontal_linear_patterns(graph, options)
 
+    if options.enable_swiglu and options.enable_horizontal_mlp:
+        _fuse_swiglu_concatenated_patterns(graph)
+
+    if options.enable_sdpa_transpose:
+        _fuse_sdpa_transpose_patterns(graph)
+
+    # After horizontal fusion so QKV / gate+up are single Linears (one bake each).
+    if options.enable_bake_rms_into_linear:
+        _bake_rms_weights_into_linears(graph)
+
+    if options.enable_bake_affine:
+        from ggmlc.transforms.affine_bake import (
+            bake_const_affine_into_gemms,
+            bake_norm_affine_into_gemms,
+        )
+
+        bake_norm_affine_into_gemms(graph, OpCode.LAYER_NORM)
+        bake_const_affine_into_gemms(graph)
+        # Conv+BN fold can expose a direct Conv→ReLU that the earlier pass missed.
+        if options.enable_conv2d_relu:
+            _fuse_conv2d_relu_patterns(graph)
+
     return graph
+
+
+def _bake_rms_weights_into_linears(graph: Graph) -> int:
+    """Absorb RMSNorm gamma into consumer Linear/MatMul weights; leave weightless RMS_NORM.
+
+    Math (PyTorch Linear ``W[out, in]``, ``y = x_scaled @ W.T``):
+      ``x_scaled[..., k] = rms(x)[..., k] * gamma[k]``
+      ``W'[j, k] = W[j, k] * gamma[k]``  (scale columns / in_features)
+
+    For HF Conv1D / ``aten.addmm`` weights stored as ``W[in, out]``, scale rows instead.
+
+    Only rewrites when every consumer of the RMS output is a GEMM whose activation
+    input is that tensor (no residual / view / RoPE fanout). Returns number baked.
+    """
+    from ggmlc.transforms.affine_bake import bake_norm_affine_into_gemms
+
+    return bake_norm_affine_into_gemms(graph, OpCode.RMS_NORM)
 
 
 def _fuse_rope_patterns(graph: Graph) -> None:
@@ -696,6 +758,194 @@ def _fuse_swiglu_patterns(graph: Graph) -> None:
     graph.nodes = final_nodes
 
 
+def _fuse_approx_gelu_patterns(graph: Graph) -> None:
+    """Matches polynomial NewGELU approximation subgraphs:
+    0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    and folds the entire elementary operation sub-DAG into a single OpCode.GELU(approximate="tanh").
+    """
+    producer_map: dict[int, Operation] = {}
+    consumer_map: dict[int, list[Operation]] = {}
+    for op in graph.nodes:
+        for out_id in op.outputs:
+            producer_map[out_id] = op
+        for in_id in op.inputs:
+            consumer_map.setdefault(in_id, []).append(op)
+
+    def get_const_val(t_id: int) -> float | None:
+        t = graph.get_tensor(t_id)
+        if (
+            t
+            and t.storage in (StorageClass.CONSTANT, StorageClass.PARAMETER)
+            and t.data is not None
+        ):
+            if hasattr(t.data, "item"):
+                try:
+                    return float(t.data.item())
+                except (TypeError, ValueError):
+                    return None
+            try:
+                return float(t.data)
+            except (TypeError, ValueError):
+                return None
+
+    ops_to_remove: set[int] = set()
+    new_nodes: list[Operation] = []
+
+    for op in graph.nodes:
+        if op.id in ops_to_remove:
+            continue
+
+        if op.opcode == OpCode.TANH and len(op.inputs) == 1:
+            tanh_in = op.inputs[0]
+            prod_mul_c = producer_map.get(tanh_in)
+            if not prod_mul_c or prod_mul_c.opcode != OpCode.MUL or len(prod_mul_c.inputs) != 2:
+                new_nodes.append(op)
+                continue
+
+            # Check for sqrt(2/pi) approx 0.79788
+            c_val = None
+            poly_sum_id = None
+            for inp in prod_mul_c.inputs:
+                v = get_const_val(inp)
+                if v is not None and abs(v - 0.79788) < 0.02:
+                    c_val = v
+                else:
+                    poly_sum_id = inp
+
+            if c_val is None or poly_sum_id is None:
+                new_nodes.append(op)
+                continue
+
+            prod_poly_add = producer_map.get(poly_sum_id)
+            if (
+                not prod_poly_add
+                or prod_poly_add.opcode != OpCode.ADD
+                or len(prod_poly_add.inputs) != 2
+            ):
+                new_nodes.append(op)
+                continue
+
+            # In ADD(x, 0.044715 * x^3), identify x and cube_term
+            x_cand = None
+            cube_op = None
+            for inp in prod_poly_add.inputs:
+                p = producer_map.get(inp)
+                if p and p.opcode == OpCode.MUL:
+                    cube_op = p
+                else:
+                    x_cand = inp
+
+            if not cube_op or x_cand is None:
+                new_nodes.append(op)
+                continue
+
+            # Check 0.044715 in cube_op
+            c_coeff = None
+            pow_id = None
+            for inp in cube_op.inputs:
+                v = get_const_val(inp)
+                if v is not None and abs(v - 0.044715) < 0.01:
+                    c_coeff = v
+                else:
+                    pow_id = inp
+
+            if c_coeff is None or pow_id is None:
+                new_nodes.append(op)
+                continue
+
+            # Check downstream: TANH -> ADD(..., 1.0) -> MUL(..., 0.5 * x)
+            tanh_consumers = consumer_map.get(op.outputs[0], [])
+            if len(tanh_consumers) != 1:
+                new_nodes.append(op)
+                continue
+
+            add1_op = tanh_consumers[0]
+            if add1_op.opcode != OpCode.ADD or len(add1_op.inputs) != 2:
+                new_nodes.append(op)
+                continue
+
+            has_one = any(
+                get_const_val(inp) is not None and abs(get_const_val(inp) - 1.0) < 1e-3
+                for inp in add1_op.inputs
+            )
+            if not has_one:
+                new_nodes.append(op)
+                continue
+
+            add1_consumers = consumer_map.get(add1_op.outputs[0], [])
+            if len(add1_consumers) != 1:
+                new_nodes.append(op)
+                continue
+
+            mul_final_op = add1_consumers[0]
+            if mul_final_op.opcode != OpCode.MUL or len(mul_final_op.inputs) != 2:
+                new_nodes.append(op)
+                continue
+
+            # Find the other input to mul_final_op
+            other_inp = (
+                mul_final_op.inputs[0]
+                if mul_final_op.inputs[1] == add1_op.outputs[0]
+                else mul_final_op.inputs[1]
+            )
+            # other_inp should be 0.5 * x or x
+            prod_half = producer_map.get(other_inp)
+            final_out_op = mul_final_op
+            matched_gelu = False
+
+            if prod_half and prod_half.opcode == OpCode.MUL:
+                # Check if it multiplies x_cand by 0.5
+                if x_cand in prod_half.inputs:
+                    for inp in prod_half.inputs:
+                        v = get_const_val(inp)
+                        if v is not None and abs(v - 0.5) < 1e-3:
+                            matched_gelu = True
+                            ops_to_remove.add(prod_half.id)
+                            break
+            elif other_inp == x_cand:
+                # Might have an outer MUL by 0.5
+                outer_consumers = consumer_map.get(mul_final_op.outputs[0], [])
+                if len(outer_consumers) == 1 and outer_consumers[0].opcode == OpCode.MUL:
+                    outer_mul = outer_consumers[0]
+                    for inp in outer_mul.inputs:
+                        v = get_const_val(inp)
+                        if v is not None and abs(v - 0.5) < 1e-3:
+                            matched_gelu = True
+                            final_out_op = outer_mul
+                            ops_to_remove.add(mul_final_op.id)
+                            break
+
+            if not matched_gelu:
+                new_nodes.append(op)
+                continue
+
+            # Mark all intermediate polynomial nodes for removal
+            ops_to_remove.add(op.id)
+            ops_to_remove.add(prod_mul_c.id)
+            ops_to_remove.add(prod_poly_add.id)
+            ops_to_remove.add(cube_op.id)
+            prod_pow = producer_map.get(pow_id)
+            if prod_pow and len(consumer_map.get(pow_id, [])) <= 1:
+                ops_to_remove.add(prod_pow.id)
+            ops_to_remove.add(add1_op.id)
+            ops_to_remove.add(final_out_op.id)
+
+            fused_op = Operation(
+                id=graph.new_op_id(),
+                opcode=OpCode.GELU,
+                inputs=[x_cand],
+                outputs=list(final_out_op.outputs),
+                attributes={"approximate": "tanh"},
+                name=f"{final_out_op.name or 'gelu'}_approx_fused",
+            )
+            new_nodes.append(fused_op)
+            continue
+
+        new_nodes.append(op)
+
+    graph.nodes = [n for n in new_nodes if n.id not in ops_to_remove]
+
+
 def _fuse_bias_gelu_patterns(graph: Graph) -> None:
     """Matches Linear(x, w, bias) -> GELU or Add(x, bias) -> GELU and fuses into BIAS_GELU."""
     producer_map: dict[int, Operation] = {}
@@ -1108,3 +1358,111 @@ def _fuse_horizontal_linear_patterns(graph: Graph, options: FusionOptions) -> No
             else:
                 new_nodes.append(op)
         graph.nodes = new_nodes
+
+
+def _fuse_swiglu_concatenated_patterns(graph: Graph) -> None:
+    """Fuses SLICE(0..d, parent) and SLICE(d..2d, parent) feeding SWIGLU(gate, up)
+    into a single-input SWIGLU(parent), eliminating the two slice operations."""
+    producer_map: dict[int, Operation] = {}
+    consumer_map: dict[int, list[Operation]] = {}
+    for op in graph.nodes:
+        for out_id in op.outputs:
+            producer_map[out_id] = op
+        for in_id in op.inputs:
+            consumer_map.setdefault(in_id, []).append(op)
+
+    ops_to_remove: set[int] = set()
+    for op in graph.nodes:
+        if op.opcode != OpCode.SWIGLU or len(op.inputs) != 2:
+            continue
+        gate_id, up_id = op.inputs[0], op.inputs[1]
+        prod_gate = producer_map.get(gate_id)
+        prod_up = producer_map.get(up_id)
+
+        if not (prod_gate and prod_up):
+            continue
+        if prod_gate.opcode not in (OpCode.SLICE, OpCode.VIEW) or prod_up.opcode not in (
+            OpCode.SLICE,
+            OpCode.VIEW,
+        ):
+            continue
+        if len(prod_gate.inputs) < 1 or len(prod_up.inputs) < 1:
+            continue
+        if prod_gate.inputs[0] != prod_up.inputs[0]:
+            continue
+
+        parent_id = prod_gate.inputs[0]
+        # Gate and up must only be consumed by this SWIGLU op
+        if len(consumer_map.get(gate_id, [])) != 1 or len(consumer_map.get(up_id, [])) != 1:
+            continue
+
+        start0 = prod_gate.attributes.get("start", 0)
+        end0 = prod_gate.attributes.get("end", 0)
+        start1 = prod_up.attributes.get("start", 0)
+        end1 = prod_up.attributes.get("end", 0)
+
+        if start0 == 0 and end0 > 0 and start1 == end0 and end1 == 2 * end0:
+            # Gate is [0..d], Up is [d..2d] -> Standard non-swapped
+            op.inputs = [parent_id]
+            ops_to_remove.add(prod_gate.id)
+            ops_to_remove.add(prod_up.id)
+            graph.tensors.pop(gate_id, None)
+            graph.tensors.pop(up_id, None)
+        elif start1 == 0 and end1 > 0 and start0 == end1 and end0 == 2 * end1:
+            # Up is [0..d], Gate is [d..2d] -> Swapped
+            op.inputs = [parent_id]
+            op.attributes["swapped"] = 1
+            ops_to_remove.add(prod_gate.id)
+            ops_to_remove.add(prod_up.id)
+            graph.tensors.pop(gate_id, None)
+            graph.tensors.pop(up_id, None)
+
+    if ops_to_remove:
+        graph.nodes = [op for op in graph.nodes if op.id not in ops_to_remove]
+
+
+def _fuse_sdpa_transpose_patterns(graph: Graph) -> None:
+    """Fuses transpose following scaled dot-product attention (SDPA):
+    SDPA(...) -> (B, H, S, D) -> TRANSPOSE(dim0=1, dim1=2) -> (B, S, H, D)
+    is fused by letting SDPA directly produce the (B, S, H, D) layout with
+    fused_transpose=1 attribute, eliminating redundant permute/transpose steps.
+    """
+    consumers: dict[int, list[Operation]] = {}
+    for n in graph.nodes:
+        for in_id in n.inputs:
+            consumers.setdefault(in_id, []).append(n)
+    state_tids = {s.id for s in graph.states}
+    graph_outs = set(graph.outputs) | state_tids
+
+    nodes_to_remove = set()
+    for n in graph.nodes:
+        if n.opcode != OpCode.SDPA:
+            continue
+        out_id = n.outputs[0]
+        if out_id in graph_outs:
+            continue
+        cons = consumers.get(out_id, [])
+        if len(cons) != 1:
+            continue
+        n_trans = cons[0]
+        if n_trans.opcode != OpCode.TRANSPOSE:
+            continue
+        d0 = n_trans.attributes.get("dim0", 0)
+        d1 = n_trans.attributes.get("dim1", 1)
+        trans_in_t = graph.tensors.get(out_id)
+        if trans_in_t is not None:
+            r = len(trans_in_t.shape.dims)
+            if d0 < 0:
+                d0 += r
+            if d1 < 0:
+                d1 += r
+        if {d0, d1} != {1, 2}:
+            continue
+
+        trans_out_id = n_trans.outputs[0]
+        n.outputs = [trans_out_id]
+        n.attributes["fused_transpose"] = 1
+        nodes_to_remove.add(n_trans.id)
+
+    if nodes_to_remove:
+        graph.nodes = [n for n in graph.nodes if n.id not in nodes_to_remove]

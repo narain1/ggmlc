@@ -23,6 +23,23 @@ from ggmlc.ir.shape import (
 from ggmlc.ir.tensor import StorageClass, Tensor
 
 
+def _static_index(x: Any, default: int = 0, *, cap_unbounded: bool = False) -> int:
+    """Slice bound as a Python int. Symbolic ends are resolved via the output shape."""
+    if x is None:
+        return default
+    if isinstance(x, Node):
+        return default
+    if isinstance(x, torch.SymInt):
+        return default
+    try:
+        v = int(x)
+    except (TypeError, ValueError):
+        return default
+    if cap_unbounded and v >= 9223372036854775800:
+        return default
+    return v
+
+
 def _symint_to_dim(sym: Any) -> Dim:
     """Convert torch.SymInt or int/expression to Dim."""
     if isinstance(sym, int):
@@ -78,6 +95,7 @@ def import_exported_program(ep: ExportedProgram, graph_name: str = "main") -> Gr
     lifted_constants = dict(getattr(sig, "inputs_to_lifted_tensor_constants", {}))
 
     # 1. Process placeholder nodes
+    param_ptrs: dict[int, tuple[Tensor, torch.Tensor]] = {}
     for node in ep.graph.nodes:
         if node.op != "placeholder":
             continue
@@ -95,6 +113,18 @@ def import_exported_program(ep: ExportedProgram, graph_name: str = "main") -> Gr
         if target_name in lifted_params:
             param_name = lifted_params[target_name]
             param_tensor = ep.state_dict[param_name]
+            ptr = param_tensor.data_ptr()
+            if ptr in param_ptrs:
+                existing_t, existing_param = param_ptrs[ptr]
+                if (
+                    param_tensor.shape == existing_param.shape
+                    and param_tensor.stride() == existing_param.stride()
+                    and param_tensor.dtype == existing_param.dtype
+                ):
+                    node_to_tensor[node] = existing_t
+                    name_to_tensor[node.name] = existing_t
+                    continue
+
             t = g.add_tensor(
                 name=param_name,
                 shape=Shape.from_tuple(tuple(param_tensor.shape)),
@@ -104,6 +134,7 @@ def import_exported_program(ep: ExportedProgram, graph_name: str = "main") -> Gr
                 role="parameter",
             )
             g.parameters.append(t.id)
+            param_ptrs[ptr] = (t, param_tensor)
         elif target_name in lifted_buffers or target_name in lifted_constants:
             buf_name = lifted_buffers.get(target_name, lifted_constants.get(target_name))
             buf_tensor = ep.constants.get(
@@ -111,6 +142,18 @@ def import_exported_program(ep: ExportedProgram, graph_name: str = "main") -> Gr
                 ep.state_dict.get(buf_name, getattr(ep, "tensor_constants", {}).get(buf_name)),
             )
             data = buf_tensor.detach().cpu().numpy() if buf_tensor is not None else None
+            ptr = buf_tensor.data_ptr() if buf_tensor is not None else None
+            if ptr is not None and ptr in param_ptrs:
+                existing_t, existing_param = param_ptrs[ptr]
+                if (
+                    buf_tensor.shape == existing_param.shape
+                    and buf_tensor.stride() == existing_param.stride()
+                    and buf_tensor.dtype == existing_param.dtype
+                ):
+                    node_to_tensor[node] = existing_t
+                    name_to_tensor[node.name] = existing_t
+                    continue
+
             t = g.add_tensor(
                 name=buf_name,
                 shape=Shape.from_tuple(tuple(buf_tensor.shape))
@@ -122,6 +165,8 @@ def import_exported_program(ep: ExportedProgram, graph_name: str = "main") -> Gr
                 role="constant",
             )
             g.parameters.append(t.id)
+            if ptr is not None and buf_tensor is not None:
+                param_ptrs[ptr] = (t, buf_tensor)
         elif target_name in user_inputs:
             t = g.add_tensor(
                 name=node.name,
@@ -665,15 +710,11 @@ def import_exported_program(ep: ExportedProgram, graph_name: str = "main") -> Gr
                 attributes["is_select"] = 1
             else:
                 dim = int(node.args[1]) if len(node.args) > 1 else 0
-                start = int(node.args[2]) if len(node.args) > 2 and node.args[2] is not None else 0
-                end = (
-                    int(node.args[3])
-                    if len(node.args) > 3
-                    and node.args[3] is not None
-                    and node.args[3] < 9223372036854775800
-                    else -1
+                start = _static_index(node.args[2] if len(node.args) > 2 else 0, 0)
+                end = _static_index(
+                    node.args[3] if len(node.args) > 3 else None, -1, cap_unbounded=True
                 )
-                step = int(node.args[4]) if len(node.args) > 4 and node.args[4] is not None else 1
+                step = _static_index(node.args[4] if len(node.args) > 4 else 1, 1)
                 attributes["dim"] = dim
                 attributes["start"] = start
                 attributes["end"] = end
@@ -683,6 +724,14 @@ def import_exported_program(ep: ExportedProgram, graph_name: str = "main") -> Gr
             dim = node.args[1] if len(node.args) > 1 else -1
             attributes["dim"] = int(dim[0]) if isinstance(dim, (list, tuple)) else int(dim)
             attributes["keepdim"] = 1 if len(node.args) > 2 and node.args[2] else 0
+        elif opcode in (OpCode.SUM, OpCode.AMAX, OpCode.AMIN):
+            input_tensor_ids.append(node_to_tensor[node.args[0]].id)
+            dim = node.kwargs.get("dim", node.args[1] if len(node.args) > 1 else -1)
+            if isinstance(dim, (list, tuple)):
+                dim = dim[0] if len(dim) > 0 else -1
+            attributes["dim"] = int(dim) if dim is not None else -1
+            keepdim = node.kwargs.get("keepdim", node.args[2] if len(node.args) > 2 else False)
+            attributes["keepdim"] = 1 if keepdim else 0
         elif opcode == OpCode.CONCAT:
             # aten.cat.default(tensors, dim=0)
             tensors_arg = node.args[0]
